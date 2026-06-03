@@ -13,6 +13,8 @@ const TILE = 16;
 const VW = 512, VH = 448;             // viewport size in pixels
 const VW_T = VW / TILE;               // 32 cols
 const VH_T = VH / TILE;               // 28 rows
+const LEVEL_HEIGHT = 14;
+const LEVEL_Y = VH - LEVEL_HEIGHT * TILE;
 const GRAVITY = 0.45;
 const MAX_FALL = 8;
 const FRICTION = 0.85;
@@ -21,8 +23,10 @@ const RUN_ACCEL = 0.4;
 const MAX_WALK = 2.2;
 const MAX_RUN = 3.6;
 const JUMP_V = -8.2;
-const JUMP_HOLD = -0.32;              // extra lift while holding jump
-const JUMP_HOLD_FRAMES = 14;
+const JUMP_HOLD = -0.20;              // extra lift while holding jump
+const JUMP_HOLD_FRAMES = 8;
+const STOMP_BOUNCE = -5.1;
+const STOMP_GRACE = 8;
 
 // -----------------------------------------------------------------------
 // CANVAS
@@ -43,25 +47,66 @@ const hudLives = document.getElementById('hud-lives');
 // -----------------------------------------------------------------------
 const keys = {};
 const pressed = {};
+const GAMEPLAY_CODES = new Set([
+  'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown',
+  'Space', 'ShiftLeft', 'ShiftRight',
+  'KeyA', 'KeyD', 'KeyQ', 'KeyS', 'KeyW', 'KeyZ', 'KeyX', 'KeyP', 'KeyM'
+]);
+const GAMEPLAY_KEYS = new Set(['a', 'd', 'q', 's', 'w', 'z', 'x', 'p', 'm']);
+
+function normalizedKey(e) {
+  return e.key ? e.key.toLowerCase() : '';
+}
+function keyAliases(e) {
+  const aliases = [];
+  if (e.code) aliases.push(e.code);
+  const key = normalizedKey(e);
+  if (key) aliases.push('key:' + key);
+  return aliases;
+}
+function setKeyState(e, value) {
+  for (const alias of keyAliases(e)) {
+    if (value && !keys[alias]) pressed[alias] = true;
+    keys[alias] = value;
+  }
+}
+function isGameplayKey(e) {
+  if (e.ctrlKey || e.metaKey || e.altKey) return false;
+  return GAMEPLAY_CODES.has(e.code) || GAMEPLAY_KEYS.has(normalizedKey(e));
+}
+function anyKey(...aliases) {
+  return aliases.some(alias => keys[alias]);
+}
+function anyPressed(...aliases) {
+  return aliases.some(alias => pressed[alias]);
+}
+function resetInput() {
+  for (const k in keys) delete keys[k];
+  for (const k in pressed) delete pressed[k];
+}
 window.addEventListener('keydown', e => {
-  if (!keys[e.code]) pressed[e.code] = true;
-  keys[e.code] = true;
-  if ([
-    'ArrowLeft','ArrowRight','ArrowUp','ArrowDown',
-    'Space','KeyZ','KeyX','ShiftLeft','ShiftRight'
-  ].includes(e.code)) e.preventDefault();
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+  setKeyState(e, true);
+  if (isGameplayKey(e)) e.preventDefault();
 });
-window.addEventListener('keyup',   e => { keys[e.code] = false; });
+window.addEventListener('keyup', e => {
+  for (const alias of keyAliases(e)) keys[alias] = false;
+});
+window.addEventListener('blur', resetInput);
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) resetInput();
+});
 
 const Input = {
-  left()   { return keys['ArrowLeft']; },
-  right()  { return keys['ArrowRight']; },
-  jump()   { return keys['Space'] || keys['KeyZ'] || keys['ArrowUp']; },
-  jumpPressed() { return pressed['Space'] || pressed['KeyZ'] || pressed['ArrowUp']; },
-  run()    { return keys['ShiftLeft'] || keys['ShiftRight'] || keys['KeyX']; },
-  down()   { return keys['ArrowDown']; },
-  pausePressed() { return pressed['KeyP']; },
-  mutePressed()  { return pressed['KeyM']; },
+  left()   { return anyKey('ArrowLeft', 'key:q', 'key:a', 'KeyQ', 'KeyA'); },
+  right()  { return anyKey('ArrowRight', 'key:d', 'KeyD'); },
+  jump()   { return anyKey('Space', 'ArrowUp', 'key:z', 'key:w', 'KeyZ', 'KeyW'); },
+  jumpPressed() { return anyPressed('Space', 'ArrowUp', 'key:z', 'key:w', 'KeyZ', 'KeyW'); },
+  run()    { return anyKey('ShiftLeft', 'ShiftRight', 'key:x', 'KeyX'); },
+  down()   { return anyKey('ArrowDown', 'key:s', 'KeyS'); },
+  pausePressed() { return anyPressed('key:p', 'KeyP'); },
+  mutePressed()  { return anyPressed('key:m', 'KeyM'); },
+  reset: resetInput,
   flush() { for (const k in pressed) delete pressed[k]; }
 };
 
@@ -69,14 +114,23 @@ const Input = {
 // AUDIO — tiny chiptune synth
 // -----------------------------------------------------------------------
 const Audio = (() => {
-  let ctxA = null, muted = false;
+  let ctxA = null, muted = false, warnedNoAudio = false;
   const ensure = () => {
-    if (!ctxA) ctxA = new (window.AudioContext || window.webkitAudioContext)();
+    const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextCtor) {
+      if (!warnedNoAudio) {
+        console.warn('WebAudio is not available; sound effects are disabled.');
+        warnedNoAudio = true;
+      }
+      return null;
+    }
+    if (!ctxA) ctxA = new AudioContextCtor();
     return ctxA;
   };
   const beep = (freq, dur, type = 'square', vol = 0.07) => {
     if (muted) return;
     const a = ensure();
+    if (!a) return;
     const o = a.createOscillator();
     const g = a.createGain();
     o.type = type;
@@ -88,10 +142,12 @@ const Audio = (() => {
     g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
     o.start(t);
     o.stop(t + dur);
+    o.onended = () => { o.disconnect(); g.disconnect(); };
   };
   const sweep = (f1, f2, dur, type = 'square', vol = 0.07) => {
     if (muted) return;
     const a = ensure();
+    if (!a) return;
     const o = a.createOscillator();
     const g = a.createGain();
     o.type = type;
@@ -104,6 +160,7 @@ const Audio = (() => {
     g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
     o.start(t);
     o.stop(t + dur);
+    o.onended = () => { o.disconnect(); g.disconnect(); };
   };
   return {
     jump:  () => sweep(420, 820, 0.13),
@@ -726,7 +783,42 @@ SPR.koopa2L = flipH(SPR.koopa2);
 
 // Levels are stored as arrays of strings, each string = 1 row, 14 rows tall.
 // Width is variable; player scrolls horizontally.
-const LEVEL_HEIGHT = 14;
+function levelRows(width, draw) {
+  const rows = Array.from({ length: LEVEL_HEIGHT }, () => Array(width).fill(' '));
+  const put = (x, y, ch) => {
+    if (x >= 0 && x < width && y >= 0 && y < LEVEL_HEIGHT) rows[y][x] = ch;
+  };
+  const api = {
+    put,
+    run(y, x0, x1, ch) {
+      for (let x = Math.max(0, x0); x < Math.min(width, x1); x++) put(x, y, ch);
+    },
+    ground(x0, x1) {
+      this.run(12, x0, x1, '#');
+      this.run(13, x0, x1, '#');
+    },
+    platform(y, x0, x1, ch = 'B') {
+      this.run(y, x0, x1, ch);
+    },
+    coins(y, x0, x1, step = 1) {
+      for (let x = x0; x < x1; x += step) put(x, y, 'C');
+    },
+    pipe(x, topY = 9) {
+      put(x, topY, 'P'); put(x + 1, topY, 'P');
+      for (let y = topY + 1; y < 12; y++) {
+        put(x, y, 'p'); put(x + 1, y, 'p');
+      }
+    },
+    flag(x) {
+      put(x, 8, 'F');
+      for (let y = 9; y < LEVEL_HEIGHT; y++) put(x, y, 'f');
+      put(x - 2, 11, '|');
+      put(x - 2, 12, '|');
+    }
+  };
+  draw(api);
+  return rows.map(row => row.join(''));
+}
 
 const LEVEL_1_1 = [
   '                                                                                                                                                              ',
@@ -741,8 +833,8 @@ const LEVEL_1_1 = [
   '                                                                                                                                                          f  ',
   '                          G               G  G               PP        PP            G  K                                                               | f  ',
   '                                                              pp        pp                                                                              || f  ',
-  '##############     ###############      ##################   pp        pp     ###############     #######      ###################################    ###|f##',
-  '##############     ###############      ##################   pp        pp     ###############     #######      ###################################    ####f##',
+  '##############     ###############      ##################   pp   ###  pp     ###############     #######      ###################################    ###|f##',
+  '##############     ###############      ##################   pp   ###  pp     ###############     #######      ###################################    ####f##',
 ];
 
 const LEVEL_1_2 = [
@@ -758,8 +850,8 @@ const LEVEL_1_2 = [
   '            G                  K          pp     ?B?B   K             pp          XXXXXXX           G  G                       K            G       G        F   ',
   '                                          pp                          pp         XXXXXXXXX                                                                    f   ',
   '                                          pp                          pp        XXXXXXXXXXX                                                                || f   ',
-  '############       ##############      ###pp##################     ###pp###############################      ##########      ###############        #########f###',
-  '############       ##############      ###pp##################     ###pp###############################      ##########      ###############        ##########f##',
+  '############     ################      ###pp##################     ###pp###############################      ##########      ###############     ############f###',
+  '############     ################      ###pp##################     ###pp###############################      ##########      ###############     #############f##',
 ];
 
 const LEVEL_1_3 = [
@@ -775,14 +867,99 @@ const LEVEL_1_3 = [
   '                  G G                       XXXXXXXX                       G   G    G G                                  XXXXXXX        G  G  G  K              F      ',
   '                                          XXXXXXXXXX                                                                   XXXXXXXXXX                                f      ',
   '                                       XXXXXXXXXXXXX     PP                                            PP           XXXXXXXXXXXX                              | f      ',
-  '##############            ##############XXXXXXXXXXXX     pp#############################################pp########XXXXXXXXXXXXXX###################          #####f####',
-  '##############            ##############XXXXXXXXXXXX     pp#############################################pp########XXXXXXXXXXXXXX###################          ######f###',
+  '##############     #####################XXXXXXXXXXXX     pp#############################################pp########XXXXXXXXXXXXXX###################     ##########f####',
+  '##############     #####################XXXXXXXXXXXX     pp#############################################pp########XXXXXXXXXXXXXX###################     ###########f###',
 ];
 
+const LEVEL_2_1 = levelRows(150, l => {
+  l.ground(0, 29); l.ground(33, 59); l.ground(63, 91); l.ground(95, 123); l.ground(127, 150);
+  l.platform(8, 18, 23, '?'); l.platform(7, 38, 45, 'B'); l.platform(6, 69, 76, 'B');
+  l.platform(8, 101, 105, '?'); l.platform(9, 112, 118, 'X');
+  l.coins(6, 16, 27, 2); l.coins(5, 67, 79, 2); l.coins(7, 100, 110, 2);
+  l.pipe(49, 9); l.pipe(82, 8); l.pipe(133, 9);
+  [20, 42, 72, 88, 107, 116, 138].forEach(x => l.put(x, 11, 'G'));
+  [55, 119].forEach(x => l.put(x, 11, 'K'));
+  l.flag(145);
+});
+
+const LEVEL_2_2 = levelRows(160, l => {
+  l.ground(0, 25); l.ground(28, 50); l.ground(54, 77); l.ground(81, 106); l.ground(110, 133); l.ground(137, 160);
+  l.platform(9, 17, 21, 'X'); l.platform(7, 35, 42, '?'); l.platform(6, 62, 70, 'B');
+  l.platform(8, 88, 96, 'X'); l.platform(6, 116, 122, '?'); l.platform(9, 126, 131, 'B');
+  l.coins(5, 34, 44, 2); l.coins(4, 61, 72, 2); l.coins(6, 115, 124, 2);
+  l.pipe(45, 9); l.pipe(100, 8); l.pipe(141, 9);
+  [18, 39, 64, 91, 117, 128, 146].forEach(x => l.put(x, 11, 'G'));
+  [72, 103, 132].forEach(x => l.put(x, 11, 'K'));
+  l.flag(156);
+});
+
+const LEVEL_2_3 = levelRows(170, l => {
+  l.ground(0, 36); l.ground(40, 73); l.ground(77, 111); l.ground(115, 149); l.ground(153, 170);
+  l.platform(8, 14, 20, 'B'); l.platform(6, 28, 33, '?'); l.platform(7, 53, 61, 'B');
+  l.platform(5, 87, 96, '?'); l.platform(8, 119, 127, 'B'); l.platform(6, 139, 145, 'X');
+  l.coins(5, 12, 22, 2); l.coins(4, 84, 99, 3); l.coins(7, 118, 130, 2);
+  l.pipe(67, 8); l.pipe(105, 9); l.pipe(156, 8);
+  [22, 31, 56, 89, 94, 123, 142, 158].forEach(x => l.put(x, 11, 'G'));
+  [70, 109, 147].forEach(x => l.put(x, 11, 'K'));
+  l.flag(166);
+});
+
+const LEVEL_3_1 = levelRows(165, l => {
+  l.ground(0, 31); l.ground(35, 63); l.ground(67, 96); l.ground(100, 127); l.ground(131, 165);
+  l.platform(2, 0, 165, 'X');
+  l.platform(8, 18, 26, 'X'); l.platform(6, 42, 51, 'B'); l.platform(8, 72, 80, '?');
+  l.platform(5, 103, 111, 'X'); l.platform(8, 119, 124, 'B'); l.platform(7, 143, 150, '?');
+  l.coins(5, 43, 52, 2); l.coins(6, 72, 82, 2); l.coins(5, 143, 153, 2);
+  l.pipe(57, 9); l.pipe(90, 8); l.pipe(135, 9);
+  [20, 47, 75, 107, 122, 146, 152].forEach(x => l.put(x, 11, 'G'));
+  [59, 92, 137].forEach(x => l.put(x, 11, 'K'));
+  l.flag(161);
+});
+
+const LEVEL_3_2 = levelRows(175, l => {
+  l.ground(0, 27); l.ground(31, 58); l.ground(63, 88); l.ground(92, 119); l.ground(124, 150); l.ground(154, 175);
+  l.platform(8, 16, 21, '?'); l.platform(7, 39, 46, 'X'); l.platform(6, 69, 76, 'B');
+  l.platform(8, 100, 107, '?'); l.platform(5, 132, 139, 'X'); l.platform(8, 144, 149, 'B');
+  l.coins(5, 14, 24, 2); l.coins(4, 68, 79, 2); l.coins(6, 98, 110, 2); l.coins(4, 132, 141, 2);
+  l.pipe(52, 8); l.pipe(83, 9); l.pipe(114, 8); l.pipe(158, 9);
+  [18, 42, 72, 78, 103, 136, 146, 162].forEach(x => l.put(x, 11, 'G'));
+  [54, 86, 116, 151].forEach(x => l.put(x, 11, 'K'));
+  l.flag(171);
+});
+
+const LEVEL_3_3 = levelRows(168, l => {
+  l.ground(0, 23); l.ground(28, 48); l.ground(53, 75); l.ground(80, 102); l.ground(107, 129); l.ground(134, 168);
+  l.platform(9, 18, 26, 'X'); l.platform(7, 34, 43, 'B'); l.platform(5, 58, 68, '?');
+  l.platform(8, 86, 96, 'X'); l.platform(6, 113, 123, 'B'); l.platform(8, 142, 151, '?');
+  l.coins(6, 33, 45, 2); l.coins(3, 58, 70, 2); l.coins(5, 112, 125, 2); l.coins(6, 141, 153, 2);
+  l.pipe(70, 9); l.pipe(124, 9); l.pipe(150, 8);
+  [20, 38, 62, 90, 117, 146, 154].forEach(x => l.put(x, 11, 'G'));
+  [72, 126].forEach(x => l.put(x, 11, 'K'));
+  l.flag(164);
+});
+
+const LEVEL_4_1 = levelRows(190, l => {
+  l.ground(0, 32); l.ground(36, 67); l.ground(71, 101); l.ground(106, 137); l.ground(142, 165); l.ground(169, 190);
+  l.platform(8, 16, 24, '?'); l.platform(6, 42, 51, 'B'); l.platform(7, 78, 88, 'X');
+  l.platform(5, 114, 124, '?'); l.platform(8, 131, 138, 'B'); l.platform(6, 154, 162, 'X');
+  l.coins(5, 15, 27, 2); l.coins(4, 41, 53, 2); l.coins(5, 77, 90, 2); l.coins(3, 113, 126, 2); l.coins(5, 153, 164, 2);
+  l.pipe(60, 8); l.pipe(95, 9); l.pipe(129, 8); l.pipe(173, 8);
+  [20, 46, 81, 87, 118, 134, 157, 176, 182].forEach(x => l.put(x, 11, 'G'));
+  [62, 97, 131, 166].forEach(x => l.put(x, 11, 'K'));
+  l.flag(186);
+});
+
 const LEVELS = [
-  { name: '1-1', data: LEVEL_1_1, bg: '#6b8cff' },
-  { name: '1-2', data: LEVEL_1_2, bg: '#5878ff' },
-  { name: '1-3', data: LEVEL_1_3, bg: '#3050c0' }
+  { name: '1-1', data: LEVEL_1_1, biome: 'meadow', bg: '#6b8cff' },
+  { name: '1-2', data: LEVEL_1_2, biome: 'meadow', bg: '#5878ff' },
+  { name: '1-3', data: LEVEL_1_3, biome: 'twilight', bg: '#3050c0' },
+  { name: '2-1', data: LEVEL_2_1, biome: 'desert' },
+  { name: '2-2', data: LEVEL_2_2, biome: 'ice' },
+  { name: '2-3', data: LEVEL_2_3, biome: 'forest' },
+  { name: '3-1', data: LEVEL_3_1, biome: 'cave' },
+  { name: '3-2', data: LEVEL_3_2, biome: 'volcano' },
+  { name: '3-3', data: LEVEL_3_3, biome: 'sky' },
+  { name: '4-1', data: LEVEL_4_1, biome: 'night' }
 ];
 
 // -----------------------------------------------------------------------
@@ -824,7 +1001,7 @@ function buildLevel(def) {
     tiles.push(trow);
   }
   return {
-    name: def.name, bg: def.bg, w, h, tiles, enemies,
+    name: def.name, biome: def.biome || 'meadow', bg: def.bg, w, h, tiles, enemies,
     pixelW: w * TILE, pixelH: h * TILE,
     flagX: flagX >= 0 ? flagX * TILE : (w-3) * TILE,
     spawnX, spawnY
@@ -861,6 +1038,7 @@ class Entity {
     this.onGround = false;
     this.dead = false;
     this.facing = 1; // 1 right, -1 left
+    this.prevX = x; this.prevY = y; this.prevBottom = y + h;
   }
   get cx() { return this.x + this.w/2; }
   get cy() { return this.y + this.h/2; }
@@ -950,7 +1128,7 @@ class Player extends Entity {
     } else {
       img = this.facing > 0 ? S.stand : S.standL;
     }
-    ctx.drawImage(img, Math.round(this.x - camX + this.spriteOffsetX), Math.round(this.y));
+    ctx.drawImage(img, Math.round(this.x - camX + this.spriteOffsetX), Math.round(this.y + LEVEL_Y));
   }
 }
 
@@ -980,7 +1158,7 @@ class Goomba extends Entity {
     let img;
     if (this.flat) img = SPR.goombaFlat;
     else img = (Math.floor(this.animTime / 12) & 1) ? SPR.goomba2 : SPR.goomba1;
-    ctx.drawImage(img, Math.round(this.x - camX - 1), Math.round(this.y - 2));
+    ctx.drawImage(img, Math.round(this.x - camX - 1), Math.round(this.y + LEVEL_Y - 2));
   }
 }
 
@@ -991,9 +1169,11 @@ class Koopa extends Entity {
     this.vx = -0.5;
     this.shell = false;
     this.shellMoving = false;
+    this.shellCooldown = 0;
     this.animTime = 0;
   }
   update(level) {
+    if (this.shellCooldown > 0) this.shellCooldown--;
     this.vy = Math.min(MAX_FALL, this.vy + GRAVITY);
     moveAndCollide(this, level, false);
     if (this.hitWallX) this.vx = -this.vx;
@@ -1001,7 +1181,7 @@ class Koopa extends Entity {
   }
   stomp() {
     if (!this.shell) {
-      this.shell = true; this.shellMoving = false; this.vx = 0; this.h = 14;
+      this.shell = true; this.shellMoving = false; this.shellCooldown = 10; this.vx = 0; this.h = 14;
     } else if (!this.shellMoving) {
       // kicked elsewhere
     }
@@ -1024,7 +1204,7 @@ class Koopa extends Entity {
         ? (f ? SPR.koopa2 : SPR.koopa1)
         : (f ? SPR.koopa2L : SPR.koopa1L);
     }
-    ctx.drawImage(img, Math.round(this.x - camX - 1), Math.round(this.y - (this.shell ? 0 : 0)));
+    ctx.drawImage(img, Math.round(this.x - camX - 1), Math.round(this.y + LEVEL_Y));
   }
 }
 
@@ -1034,7 +1214,7 @@ class FloatingCoin {
   update() { this.vy += 0.25; this.y += this.vy; this.t++; if (this.t > 28) this.dead = true; }
   draw(camX) {
     const img = (this.t >> 1) & 1 ? SPR.coin1 : SPR.coin2;
-    ctx.drawImage(img, Math.round(this.x - camX), Math.round(this.y));
+    ctx.drawImage(img, Math.round(this.x - camX), Math.round(this.y + LEVEL_Y));
   }
 }
 
@@ -1047,9 +1227,9 @@ class Popup {
   draw(camX) {
     ctx.fillStyle = '#000';
     ctx.font = 'bold 10px "Courier New", monospace';
-    ctx.fillText(this.text, this.x - camX + 1, this.y + 1);
+    ctx.fillText(this.text, this.x - camX + 1, this.y + LEVEL_Y + 1);
     ctx.fillStyle = this.color;
-    ctx.fillText(this.text, this.x - camX, this.y);
+    ctx.fillText(this.text, this.x - camX, this.y + LEVEL_Y);
   }
 }
 
@@ -1057,6 +1237,9 @@ class Popup {
 // COLLISION (axis-separated, tile based)
 // -----------------------------------------------------------------------
 function moveAndCollide(e, level, isPlayer) {
+  e.prevX = e.x;
+  e.prevY = e.y;
+  e.prevBottom = e.bottom;
   e.hitWallX = false;
   // X axis
   e.x += e.vx;
@@ -1158,23 +1341,103 @@ function drawTile(t, px, py) {
     case T_FLAGBASE:  ctx.drawImage(SPR.hard, px, py); break;
   }
 }
+
+const THEMES = {
+  meadow:  { skyTop: '#6b8cff', skyBottom: '#b9e6ff', sun: '#ffe066', cloud: '#ffffff', hillFar: '#5fbf55', hillNear: '#2e8d3c', deco: '#60c96b' },
+  twilight:{ skyTop: '#263875', skyBottom: '#f08a66', sun: '#ffd166', cloud: '#ffd0aa', hillFar: '#4b5b86', hillNear: '#2f4669', deco: '#4f9a5c', stars: true },
+  desert:  { skyTop: '#ffb85c', skyBottom: '#ffe0a3', sun: '#fff0a6', cloud: '#fff3d8', hillFar: '#d59a45', hillNear: '#b9772f', deco: '#e6b25b' },
+  ice:     { skyTop: '#bdefff', skyBottom: '#eefcff', sun: '#ffffff', cloud: '#f8ffff', hillFar: '#8ed7ef', hillNear: '#5fb8d6', deco: '#d7fbff' },
+  forest:  { skyTop: '#4f8f68', skyBottom: '#a7d98b', sun: '#ffe066', cloud: '#e8ffe0', hillFar: '#367a4a', hillNear: '#215c35', deco: '#6cc04a' },
+  cave:    { skyTop: '#171225', skyBottom: '#302642', cloud: null, hillFar: '#45385c', hillNear: '#292038', deco: '#6f65a8', ceiling: '#0f0b18', stars: true },
+  volcano: { skyTop: '#3a1720', skyBottom: '#c84b31', sun: '#ff9b43', cloud: '#6b2a2a', hillFar: '#5d2330', hillNear: '#2a1620', deco: '#ff7a1a', embers: true },
+  sky:     { skyTop: '#54b8ff', skyBottom: '#dff7ff', sun: '#fff4a8', cloud: '#ffffff', hillFar: '#95ddff', hillNear: '#65bfe8', deco: '#ffffff' },
+  night:   { skyTop: '#101936', skyBottom: '#243d73', sun: '#f6f3c9', cloud: '#aeb9dc', hillFar: '#25385f', hillNear: '#172747', deco: '#8ec6ff', stars: true }
+};
+
+function wrapParallax(i, spacing, camX, rate, level, margin) {
+  const span = level.pixelW + margin * 2;
+  return ((i * spacing - camX * rate) % span + span) % span - margin;
+}
+function drawOrb(theme) {
+  if (!theme.sun) return;
+  ctx.fillStyle = theme.sun;
+  ctx.beginPath();
+  ctx.arc(VW - 74, 62, theme.stars ? 22 : 28, 0, Math.PI * 2);
+  ctx.fill();
+}
+function drawStars(camX, color = '#ffffff') {
+  ctx.fillStyle = color;
+  for (let i = 0; i < 36; i++) {
+    const x = (i * 73 - camX * 0.08) % (VW + 80);
+    const y = 18 + ((i * 37) % 130);
+    ctx.fillRect((x + VW + 80) % (VW + 80) - 40, y, (i % 5) ? 1 : 2, 1);
+  }
+}
+function drawCloudShape(x, y, color) {
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.arc(x + 14, y + 10, 10, 0, Math.PI * 2);
+  ctx.arc(x + 28, y + 8, 14, 0, Math.PI * 2);
+  ctx.arc(x + 45, y + 12, 11, 0, Math.PI * 2);
+  ctx.fillRect(x + 10, y + 10, 44, 13);
+  ctx.fill();
+}
+function drawMounds(camX, level, color, rate, baseY, height, spacing, width) {
+  ctx.fillStyle = color;
+  for (let i = 0; i < 8; i++) {
+    const x = wrapParallax(i, spacing, camX, rate, level, width);
+    ctx.beginPath();
+    ctx.moveTo(x, baseY);
+    ctx.quadraticCurveTo(x + width / 2, baseY - height - (i % 3) * 12, x + width, baseY);
+    ctx.lineTo(x + width, VH);
+    ctx.lineTo(x, VH);
+    ctx.fill();
+  }
+}
+function drawEmbers(camX) {
+  ctx.fillStyle = '#ffd166';
+  for (let i = 0; i < 18; i++) {
+    const x = (i * 97 - camX * 0.2 + state.frame * 0.4) % (VW + 80);
+    const y = 50 + ((i * 43 + state.frame) % 190);
+    ctx.fillRect((x + VW + 80) % (VW + 80) - 40, y, 2, 2);
+  }
+}
 function drawBackground(camX, level) {
-  ctx.fillStyle = level.bg;
+  const theme = THEMES[level.biome] || THEMES.meadow;
+  const sky = ctx.createLinearGradient(0, 0, 0, VH);
+  sky.addColorStop(0, theme.skyTop || level.bg || '#6b8cff');
+  sky.addColorStop(1, theme.skyBottom || level.bg || '#b9e6ff');
+  ctx.fillStyle = sky;
   ctx.fillRect(0, 0, VW, VH);
 
-  // clouds, hills, bushes — parallax
-  for (let i = 0; i < 8; i++) {
-    const cx = ((i * 220 - camX * 0.3) % (level.pixelW + 200) + level.pixelW + 200) % (level.pixelW + 200) - 100;
-    ctx.drawImage(SPR.cloud, cx | 0, 30 + (i % 3) * 20);
+  if (theme.stars) drawStars(camX);
+  drawOrb(theme);
+
+  if (theme.ceiling) {
+    ctx.fillStyle = theme.ceiling;
+    ctx.fillRect(0, 0, VW, 26);
+    for (let i = 0; i < 18; i++) {
+      const x = wrapParallax(i, 48, camX, 0.18, level, 40);
+      ctx.fillRect(x, 20, 14 + (i % 4) * 5, 8 + (i % 5) * 5);
+    }
   }
-  for (let i = 0; i < 6; i++) {
-    const cx = ((i * 360 - camX * 0.5) % (level.pixelW + 400) + level.pixelW + 400) % (level.pixelW + 400) - 200;
-    ctx.drawImage(SPR.hill, cx | 0, VH - 64 - 22);
+
+  if (theme.cloud) {
+    for (let i = 0; i < 7; i++) {
+      const x = wrapParallax(i, 180, camX, 0.24, level, 90);
+      drawCloudShape(x, 36 + (i % 3) * 26, theme.cloud);
+    }
   }
-  for (let i = 0; i < 10; i++) {
-    const cx = ((i * 200 - camX * 0.7) % (level.pixelW + 200) + level.pixelW + 200) % (level.pixelW + 200) - 100;
-    ctx.drawImage(SPR.bush, cx | 0, VH - 48);
+
+  drawMounds(camX, level, theme.hillFar, 0.35, VH - 90, 70, 180, 160);
+  drawMounds(camX, level, theme.hillNear, 0.55, VH - 42, 54, 130, 120);
+
+  ctx.fillStyle = theme.deco;
+  for (let i = 0; i < 12; i++) {
+    const x = wrapParallax(i, 96, camX, 0.72, level, 60);
+    ctx.fillRect(x | 0, VH - 26 - (i % 2) * 6, 18 + (i % 3) * 8, 8);
   }
+  if (theme.embers) drawEmbers(camX);
 }
 function drawLevel(level, camX) {
   const x0 = Math.max(0, Math.floor(camX / TILE));
@@ -1182,7 +1445,7 @@ function drawLevel(level, camX) {
   for (let y = 0; y < level.h; y++) {
     for (let x = x0; x <= x1; x++) {
       const t = level.tiles[y][x];
-      if (t) drawTile(t, x*TILE - camX, y*TILE);
+      if (t) drawTile(t, x*TILE - camX, y*TILE + LEVEL_Y);
     }
   }
 }
@@ -1227,11 +1490,17 @@ function loadLevel(i) {
 }
 
 function startGame() {
+  Input.reset();
+  state.paused = false;
+  state.transition = 0;
+  state.transitionType = '';
   state.score = 0;
   state.coins = 0;
   state.lives = 3;
   loadLevel(0);
   state.running = true;
+  overlay.querySelector('h1').textContent = 'SUPER PLUMBER BROS';
+  startBtn.textContent = 'PRESS START';
   overlay.classList.add('hidden');
 }
 
@@ -1255,6 +1524,22 @@ function levelClear() {
 // -----------------------------------------------------------------------
 // COLLISION: player vs entities
 // -----------------------------------------------------------------------
+function isStomp(p, e) {
+  return p.prevBottom <= e.y + STOMP_GRACE &&
+         p.bottom >= e.y &&
+         p.cy < e.cy + 6 &&
+         p.vy >= -0.5;
+}
+function bounceAfterStomp(p) {
+  p.vy = STOMP_BOUNCE;
+  p.onGround = false;
+  p.jumpFrames = 0;
+}
+function addScore(points, e, color = '#fff') {
+  state.score += points;
+  state.entities.push(new Popup(e.x, e.y, '+' + points, color));
+  updateHud();
+}
 function handleEntityCollisions() {
   const p = state.player;
   if (p.dying || p.winning) return;
@@ -1263,33 +1548,36 @@ function handleEntityCollisions() {
     if (e instanceof Goomba) {
       if (!p.intersects(e)) continue;
       if (e.flat) continue;
-      if (p.vy > 0 && p.bottom - e.y < 10) {
-        e.stomp(); p.vy = -5; state.score += 100;
-        state.entities.push(new Popup(e.x, e.y, '+100', '#fff'));
+      if (isStomp(p, e)) {
+        e.stomp();
+        bounceAfterStomp(p);
+        addScore(100, e);
         Audio.stomp();
-        updateHud();
       } else if (p.invuln <= 0) {
         loseLife(); return;
       }
     } else if (e instanceof Koopa) {
       if (!p.intersects(e)) continue;
-      if (e.shell && !e.shellMoving) {
-        // kick stationary shell
+      const stomped = isStomp(p, e);
+      if (e.shell && e.shellMoving && stomped) {
+        e.shellMoving = false;
+        e.shellCooldown = 10;
+        e.vx = 0;
+        bounceAfterStomp(p);
+        addScore(100, e);
+        Audio.stomp();
+      } else if (e.shell && !e.shellMoving) {
+        if (e.shellCooldown > 0) continue;
         const dir = p.cx < e.cx ? 1 : -1;
         e.kick(dir);
-        state.score += 400;
-        state.entities.push(new Popup(e.x, e.y, '+400', '#ffe066'));
-        updateHud();
-      } else if (e.shell && e.shellMoving && p.vy > 0 && p.bottom - e.y < 12) {
-        // stomp moving shell to stop it
-        e.shellMoving = false; e.vx = 0;
-        p.vy = -5; state.score += 100;
-        state.entities.push(new Popup(e.x, e.y, '+100', '#fff'));
-        Audio.stomp(); updateHud();
-      } else if (!e.shell && p.vy > 0 && p.bottom - e.y < 12) {
-        e.stomp(); p.vy = -5; state.score += 200;
-        state.entities.push(new Popup(e.x, e.y, '+200', '#ffe066'));
-        Audio.stomp(); updateHud();
+        p.invuln = Math.max(p.invuln, 10);
+        if (stomped) bounceAfterStomp(p);
+        addScore(400, e, '#ffe066');
+      } else if (!e.shell && stomped) {
+        e.stomp();
+        bounceAfterStomp(p);
+        addScore(200, e, '#ffe066');
+        Audio.stomp();
       } else if (p.invuln <= 0) {
         loseLife(); return;
       }
@@ -1420,7 +1708,7 @@ function loop() {
 startBtn.addEventListener('click', () => {
   startGame();
   // unlock audio context on user gesture
-  try { Audio.jump(); } catch {}
+  Audio.jump();
 });
 window.addEventListener('keydown', e => {
   if (!state.running && (e.code === 'Enter' || e.code === 'Space')) {
