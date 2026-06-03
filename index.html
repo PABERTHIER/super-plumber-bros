@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Super Plumber Bros — Vanilla JS Platformer</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="game-wrap">
+    <div id="hud">
+      <span id="hud-score">SCORE 000000</span>
+      <span id="hud-coins">x 00</span>
+      <span id="hud-world">WORLD 1-1</span>
+      <span id="hud-lives">LIVES 3</span>
+    </div>
+    <canvas id="game" width="512" height="448"></canvas>
+    <div id="overlay">
+      <h1>SUPER PLUMBER BROS</h1>
+      <p class="sub">A vanilla-JS platformer inspired by the 80s classic</p>
+      <p class="ctrl">
+        <b>← →</b> move &nbsp; <b>SPACE / Z / ↑</b> jump &nbsp;
+        <b>SHIFT / X</b> run &nbsp; <b>P</b> pause &nbsp; <b>M</b> mute
+      </p>
+      <button id="start-btn">PRESS START</button>
+    </div>
+  </div>
+  <script src="game.js"></script>
+</body>
+</html>
